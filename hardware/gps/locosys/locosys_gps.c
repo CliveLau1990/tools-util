@@ -2,7 +2,6 @@
 * Copyright (C) 2011 The Android Open Source Project
 * Copyright (C) 2011 Atheros Communications, Inc.
 * Copyright (C) 2011-2014 Freescale Semiconductor, Inc.
-* Copyright (C) 2016 Clive Liu <clive.liu@clivetech.com>.
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -38,14 +37,17 @@
 #include <cutils/properties.h>
 #include <hardware/gps.h>
 
-#define  GPS_DEBUG
-#undef	 GPS_DEBUG_TOKEN	/* print out NMEA tokens */
+#undef  GPS_DEBUG
+#undef  GPS_DEBUG_TOKEN	/* print out NMEA tokens */
 
 #ifdef GPS_DEBUG
 #  define  D(...)   ALOGD(__VA_ARGS__)
 #else
 #  define  D(...)   ((void)0)
 #endif
+
+#define  I(...)     ALOGI(__VA_ARGS__)
+#define  E(...)     ALOGE(__VA_ARGS__)
 
 #define GPS_STATUS_CB(_cb, _s)    \
   if ((_cb).status_cb) {          \
@@ -82,6 +84,7 @@ typedef struct {
     GpsSvStatus  sv_status;
     int     sv_status_changed;
     char    in[ NMEA_MAX_SIZE+1 ];
+    int     gsa_fixed;
     LocosysTimemap_t timemap;
 } NmeaReader;
 
@@ -106,6 +109,7 @@ GpsCallbacks* g_gpscallback = NULL;
 static GpsState  _gps_state[1];
 static GpsState *gps_state = _gps_state;
 static int started    = 0;
+static int continue_thread = 1;
 
 static const char GPS_PERFORM_COLD_START[9]     = {0xF1, 0xD9, 0x06, 0x40, 0x01, 0x00, 0x01, 0x48, 0x22};
 static const char GPS_PERFORM_WARM_START[9]     = {0xF1, 0xD9, 0x06, 0x40, 0x01, 0x00, 0x02, 0x49, 0x23};
@@ -131,7 +135,7 @@ static void gps_state_lock_fix(GpsState *state) {
     while (ret < 0 && errno == EINTR);
 
     if (ret < 0) {
-        D("Error in GPS state lock:%s\n", strerror(errno));
+        E("Error in GPS state lock:%s\n", strerror(errno));
     }
 }
 
@@ -139,7 +143,7 @@ static void gps_state_unlock_fix(GpsState *state) {
     if (sem_post(&state->fix_sem) == -1) {
         if(errno == EAGAIN) {
             if(sem_post(&state->fix_sem)== -1) {
-                D("Error in GPS state unlock:%s\n", strerror(errno));
+                E("Error in GPS state unlock:%s\n", strerror(errno));
             }
         }
     }
@@ -349,8 +353,8 @@ static int nmea_reader_get_timestamp(NmeaReader*  r, Token  tok, time_t *timesta
     tm.tm_mday = r->utc_day;
     tm.tm_isdst = -1;
 
-    //D("h: %d, m: %d, s: %d", tm.tm_hour, tm.tm_min, tm.tm_sec);
-    //D("Y: %d, M: %d, D: %d", tm.tm_year, tm.tm_mon, tm.tm_mday);
+    D("h: %d, m: %d, s: %d", tm.tm_hour, tm.tm_min, tm.tm_sec);
+    D("Y: %d, M: %d, D: %d", tm.tm_year, tm.tm_mon, tm.tm_mday);
 
 	nmea_reader_update_utc_diff(r);
 
@@ -393,7 +397,7 @@ nmea_reader_update_date( NmeaReader*  r, Token  date, Token  mtime )
     int    day, mon, year;
 
     if (tok.p + 6 != tok.end) {
-        D("date not properly formatted: '%.*s'", tok.end-tok.p, tok.p);
+        E("date not properly formatted: '%.*s'", tok.end-tok.p, tok.p);
         /* no date info, will use host time in _update_time function
          */
     }
@@ -403,7 +407,7 @@ nmea_reader_update_date( NmeaReader*  r, Token  date, Token  mtime )
     year = str2int(tok.p+4, tok.p+6) + 2000;
 
     if ((day|mon|year) < 0) {
-        D("date not properly formatted: '%.*s'", tok.end-tok.p, tok.p);
+        E("date not properly formatted: '%.*s'", tok.end-tok.p, tok.p);
         return -1;
     }
 
@@ -438,7 +442,7 @@ nmea_reader_update_latlong( NmeaReader*  r,
 
     tok = latitude;
     if (tok.p + 6 > tok.end) {
-        D("latitude is too short: '%.*s'", tok.end-tok.p, tok.p);
+        E("latitude is too short: '%.*s'", tok.end-tok.p, tok.p);
         return -1;
     }
     lat = convert_from_hhmm(tok);
@@ -447,7 +451,7 @@ nmea_reader_update_latlong( NmeaReader*  r,
 
     tok = longitude;
     if (tok.p + 6 > tok.end) {
-        D("longitude is too short: '%.*s'", tok.end-tok.p, tok.p);
+        E("longitude is too short: '%.*s'", tok.end-tok.p, tok.p);
         return -1;
     }
     lon = convert_from_hhmm(tok);
@@ -570,7 +574,7 @@ nmea_reader_parse( NmeaReader*  r )
 
     D("Received: '%.*s'", r->pos, r->in);
     if (r->pos < 9) {
-        D("Too short. discarded.");
+        E("Too short. discarded.");
         return;
     }
 
@@ -596,7 +600,7 @@ nmea_reader_parse( NmeaReader*  r )
 
     tok = nmea_tokenizer_get(tzer, 0);
     if (tok.p + 5 > tok.end) {
-        D("sentence id '%.*s' too short, ignored.", tok.end-tok.p, tok.p);
+        E("sentence id '%.*s' too short, ignored.", tok.end-tok.p, tok.p);
         return;
     }
 
@@ -661,11 +665,23 @@ nmea_reader_parse( NmeaReader*  r )
                 int prn = str2int(tok_prn.p, tok_prn.end);
 
                 /* only available for PRN 1-32 */
+                D("isBDMsg: %d, prn:%d", isBDMsg, prn);
                 if ((prn > 0) && (prn < 33)){
                     r->sv_status.used_in_fix_mask |= (1ul << (prn-1));
+                    /* mark this parameter to identify the GSA is in fixed state */
+                    r->gsa_fixed = 1;
                     if (isBDMsg) {
                         r->sv_status_changed = 1;
                     }
+                }
+            }
+        } else {
+            if ( isBDMsg ) {
+                r->sv_status_changed = 1;
+            } else {
+                if ( r->gsa_fixed ) {
+                    r->sv_status.used_in_fix_mask = 0ul;
+                    r->gsa_fixed = 0;
                 }
             }
         }
@@ -688,12 +704,14 @@ nmea_reader_parse( NmeaReader*  r )
                 r->sv_status.num_svs = 0;
             }
 
-            curr = r->sv_status.num_svs;
-
-            i = 0;
             if ((sentence == 1) && isBDMsg) {
                 noSatellites += r->sv_status.num_svs;
             }
+            D("noSatellites: %d", noSatellites);
+
+            curr = r->sv_status.num_svs;
+
+            i = 0;
 
             while (i < 4 && r->sv_status.num_svs < noSatellites){
 
@@ -707,9 +725,15 @@ nmea_reader_parse( NmeaReader*  r )
                 r->sv_status.sv_list[curr].azimuth = str2float(tok_azimuth.p, tok_azimuth.end);
                 r->sv_status.sv_list[curr].snr = str2float(tok_snr.p, tok_snr.end);
 
-                r->sv_status.num_svs += 1;
+                if ( ++r->sv_status.num_svs > GPS_MAX_SVS ) {
+                    D("sv_status.num_svs: %d", r->sv_status.num_svs);
+                    r->sv_status.num_svs = GPS_MAX_SVS;
+                }
 
-                curr += 1;
+                if ( ++curr > GPS_MAX_SVS ) {
+                    D("curr: %d", curr);
+                    curr = GPS_MAX_SVS;
+                }
 
                 i += 1;
             }
@@ -770,10 +794,10 @@ nmea_reader_parse( NmeaReader*  r )
         }
     } else {
         tok.p -= 2;
-        D("unknown sentence '%.*s", tok.end-tok.p, tok.p);
+        E("unknown sentence '%.*s", tok.end-tok.p, tok.p);
     }
 
-#ifdef GPS_DEBUG
+#if 0
     if (r->fix.flags != 0) {
         char temp[256];
         char *p = temp;
@@ -797,7 +821,7 @@ nmea_reader_parse( NmeaReader*  r )
         }
         gmtime_r( (time_t*) &r->fix.timestamp, &utc );
         p += snprintf(p, end-p, " time=%s", asctime( &utc ) );
-        D("%s",temp);
+        ALOGD("%s",temp);
     }
 #endif
 }
@@ -890,7 +914,7 @@ gps_state_start( GpsState*  s )
     while (ret < 0 && errno == EINTR);
 
     if (ret != 1) {
-        D("%s: could not send CMD_START command: ret=%d: %s",
+        E("%s: could not send CMD_START command: ret=%d: %s",
             __FUNCTION__, ret, strerror(errno));
     }
 }
@@ -908,7 +932,7 @@ gps_state_stop( GpsState*  s )
 	while (ret < 0 && errno == EINTR);
 
     if (ret != 1) {
-        D("%s: could not send CMD_STOP command: ret=%d: %s",
+        E("%s: could not send CMD_STOP command: ret=%d: %s",
             __FUNCTION__, ret, strerror(errno));
     }
 }
@@ -1044,6 +1068,7 @@ gps_state_thread( void*  arg )
 Exit:
 	{
 		void *dummy;
+        continue_thread = 0;
 		close(epoll_ctrlfd);
 		close(epoll_nmeafd);
 		pthread_join(state->tmr_thread, &dummy);
@@ -1061,16 +1086,20 @@ gps_nmea_thread( void*  arg )
     reader = &state->reader;
 
 	D("gps entered nmea thread");
-	int versioncnt = 0;
 
     // now loop
-    for (;;) {
+    while (continue_thread) {
 		char buf[512];
 		int  nn, ret;
 		struct timeval tv;
 
-        if (state->fd == -1) {
+        if ( (!started) || (state->fd == -1) ) {
+            sleep(1);
             continue;
+        }
+
+        if (!continue_thread) {
+            break;
         }
 
 		fd_set readfds;
@@ -1090,9 +1119,9 @@ gps_nmea_thread( void*  arg )
 					nmea_reader_addc( reader, buf[nn] );
                 }
 			} else {
-				ALOGE("Error on NMEA read :%s",strerror(errno));
+				E("Error on NMEA read :%s",strerror(errno));
                 if (errno == EINTR) {
-				    continue;
+                    continue;
                 }
 			}
 		}
@@ -1112,9 +1141,9 @@ gps_timer_thread( void*  arg )
 
     D("gps entered timer thread");
 
-    for (;;) {
-        while(!started) {
-            usleep(500*1000);
+    do {
+        while( (started != 1) && continue_thread ) {
+            sleep(1);
         }
 
         gps_state_lock_fix(state);
@@ -1151,16 +1180,16 @@ gps_timer_thread( void*  arg )
         if (need_sleep) {
             sleep(sleep_val);
         } else {
-            D("won't sleep because fix_freq=%d state->init=%d",state->fix_freq, state->init);
+            E("won't sleep because fix_freq=%d state->init=%d",state->fix_freq, state->init);
         }
-    }
+    } while(continue_thread);
 
     D("gps timer thread destroyed");
 
     return;
 }
 
-static char   prop[PROPERTY_VALUE_MAX];
+static char   prop[PROPERTY_VALUE_MAX] = "/dev/ttymxc2";
 
 int gps_opentty(GpsState *state)
 {
@@ -1228,24 +1257,24 @@ gps_state_init( GpsState*  state )
     state->fd         = -1;
 
     if (sem_init(&state->fix_sem, 0, 1) != 0) {
-        D("gps semaphore initialization failed! errno = %d", errno);
+        E("gps semaphore initialization failed! errno = %d", errno);
         return;
     }
 
     if (property_get("ro.kernel.android.gps", prop, "/dev/ttymxc2") == 0) {
-        D("no kernel-provided gps device name (not hosted)");
-        D("please set ro.kernel.android.gps property");
+        E("no kernel-provided gps device name (not hosted)");
+        E("please set ro.kernel.android.gps property");
         return;
     }
 
     if ( socketpair( AF_LOCAL, SOCK_STREAM, 0, state->control ) < 0 ) {
-        ALOGE("could not create thread control socket pair: %s", strerror(errno));
+        E("could not create thread control socket pair: %s", strerror(errno));
         goto Fail;
     }
 
 	state->thread = state->callbacks.create_thread_cb("locosys_gps", gps_state_thread, state);
     if (!state->thread) {
-        ALOGE("could not create gps thread: %s", strerror(errno));
+        E("could not create gps thread: %s", strerror(errno));
         goto Fail;
     }
 
@@ -1309,11 +1338,13 @@ locosys_gps_start()
 	D("%s: called", __FUNCTION__ );
 
 	if(gps_checkstate(s) == -1) {
-		D("%s: called with uninitialized state !!", __FUNCTION__);
+		E("%s: called with uninitialized state !!", __FUNCTION__);
         return -1;
 	}
 
+    gps_state_lock_fix(s);
     gps_opentty(s);
+    gps_state_unlock_fix(s);
 	gps_state_start(s);
     GPS_STATUS_CB(s->callbacks, GPS_STATUS_SESSION_BEGIN);
 
@@ -1329,7 +1360,7 @@ locosys_gps_stop()
 	D("%s: called", __FUNCTION__ );
 
 	if(gps_checkstate(s) == -1) {
-		D("%s: called with uninitialized state !!", __FUNCTION__);
+		E("%s: called with uninitialized state !!", __FUNCTION__);
 		return -1;
 	}
 
@@ -1367,12 +1398,12 @@ locosys_gps_set_position_mode(GpsPositionMode mode, GpsPositionRecurrence recurr
 
     // only standalone is supported for now.
     if (mode != GPS_POSITION_MODE_STANDALONE) {
-        D("%s: set GPS POSITION mode error! (mode:%d) ", __FUNCTION__, mode);
-        D("Set as standalone mode currently! ");
+        E("%s: set GPS POSITION mode error! (mode:%d) ", __FUNCTION__, mode);
+        E("Set as standalone mode currently! ");
     }
 
     if (!s->init) {
-        D("%s: called with uninitialized state !!", __FUNCTION__);
+        E("%s: called with uninitialized state !!", __FUNCTION__);
         return -1;
     }
 
